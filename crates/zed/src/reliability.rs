@@ -2,7 +2,7 @@ use anyhow::{Context as _, Result};
 use client::{Client, telemetry::MINIDUMP_ENDPOINT};
 use feature_flags::FeatureFlagAppExt;
 use futures::{AsyncReadExt, TryStreamExt};
-use gpui::{App, AppContext as _, SerializedThreadTaskTimings};
+use gpui::{App, AppContext as _, SerializedThreadTaskTimings, TaskStatistics, TasksIncluded};
 use http_client::{self, AsyncBody, HttpClient, Request};
 use log::info;
 use project::Project;
@@ -13,7 +13,7 @@ use reqwest::{
 };
 use serde::Deserialize;
 use smol::stream::StreamExt;
-use std::{ffi::OsStr, fs, sync::Arc, thread::ThreadId, time::Duration};
+use std::{ffi::OsStr, fmt::Write, fs, str::FromStr, sync::Arc, thread::ThreadId, time::Duration};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use util::ResultExt;
 
@@ -126,7 +126,7 @@ fn monitor_hangs(cx: &App) {
                             }
 
                             if is_full {
-                                save_hang_trace(
+                                save_hang_trace_and_print_stats(
                                     main_thread_id,
                                     &background_executor,
                                     hang_time.unwrap(),
@@ -161,12 +161,34 @@ fn cleanup_old_hang_traces() {
     }
 }
 
-fn save_hang_trace(
+fn format_task_statistics(stats: &[gpui::ThreadTaskTimings]) -> Option<String> {
+    let mut res = String::new();
+    for gpui::ThreadTaskTimings {
+        thread_name,
+        thread_id,
+        stats,
+        ..
+    } in stats
+    {
+        let name = thread_name
+            .clone()
+            .unwrap_or_else(|| format!("{:?}", thread_id));
+        res.write_fmt(format_args!("thread: {name}")).ok()?;
+        res.write_fmt(format_args!("{}", stats)).ok()?;
+    }
+    Some(res)
+}
+
+fn save_hang_trace_and_print_stats(
     main_thread_id: ThreadId,
     background_executor: &gpui::BackgroundExecutor,
     hang_time: chrono::DateTime<chrono::Local>,
 ) {
-    let thread_timings = background_executor.dispatcher().get_all_timings();
+    let thread_timings = background_executor
+        .dispatcher()
+        .get_all_timings(TasksIncluded::CompletedAndRunning);
+    let thread_stats = format_task_statistics(&thread_timings);
+
     let thread_timings = thread_timings
         .into_iter()
         .map(|mut timings| {
@@ -213,10 +235,11 @@ fn save_hang_trace(
         .context("hang trace file writing")
         .log_err();
 
-    info!(
-        "hang detected, trace file saved at: {}",
-        trace_path.display()
-    );
+    info!("hang detected");
+    info!("task trace saved at: {}", trace_path.display());
+    if let Some(stats) = thread_stats {
+        info!("task statistics:\n{}", stats);
+    }
 }
 
 pub async fn upload_previous_minidumps(client: Arc<Client>) -> anyhow::Result<()> {

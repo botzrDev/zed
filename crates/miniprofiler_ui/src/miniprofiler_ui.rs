@@ -10,8 +10,9 @@ use gpui::{
     App, AppContext, ClipboardItem, Context, Div, Entity, Hsla, InteractiveElement,
     ParentElement as _, ProfilingCollector, Render, SerializedLocation, SerializedTaskTiming,
     SerializedThreadTaskTimings, SharedString, StatefulInteractiveElement, Styled, Task,
-    ThreadTimingsDelta, TitlebarOptions, UniformListScrollHandle, WeakEntity, WindowBounds,
-    WindowOptions, div, prelude::FluentBuilder, profiler, px, relative, size, uniform_list,
+    TasksIncluded, ThreadTimingsDelta, TitlebarOptions, UniformListScrollHandle, WeakEntity,
+    WindowBounds, WindowOptions, div, prelude::FluentBuilder, profiler, px, relative, size,
+    uniform_list,
 };
 use rpc::{AnyProtoClient, proto};
 use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
@@ -226,13 +227,14 @@ impl ProfilerWindow {
         match self.source {
             ProfileSource::Foreground => {
                 let dispatcher = cx.foreground_executor().dispatcher();
-                let current_thread = dispatcher.get_current_thread_timings();
+                let current_thread =
+                    dispatcher.get_current_thread_timings(TasksIncluded::OnlyCompleted);
                 let deltas = self.collector.collect_unseen(vec![current_thread]);
                 self.apply_deltas(deltas);
             }
             ProfileSource::AllThreads => {
                 let dispatcher = cx.foreground_executor().dispatcher();
-                let all_timings = dispatcher.get_all_timings();
+                let all_timings = dispatcher.get_all_timings(TasksIncluded::OnlyCompleted);
                 let deltas = self.collector.collect_unseen(all_timings);
                 self.apply_deltas(deltas);
             }
