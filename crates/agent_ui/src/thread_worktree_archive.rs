@@ -688,7 +688,7 @@ pub async fn restore_worktree_via_git(
         // `create_worktree_detached` may have left a partial directory or
         // a stale registration behind; force-remove first so the rollback
         // rename has somewhere to put the backup back.
-        remove_new_worktree_on_error(true, &main_repo, worktree_path, cx).await;
+        remove_new_worktree_on_error(&main_repo, worktree_path, cx).await;
         rollback_backup(
             app_state.fs.as_ref(),
             backup.as_ref(),
@@ -698,14 +698,12 @@ pub async fn restore_worktree_via_git(
         .await;
         return Err(error);
     }
-    let created_new_worktree = true;
 
     let (wt_repo, _temp_wt_project) =
         match find_or_create_repository(worktree_path, remote_connection, cx).await {
             Ok(result) => result,
             Err(error) => {
-                remove_new_worktree_on_error(created_new_worktree, &main_repo, worktree_path, cx)
-                    .await;
+                remove_new_worktree_on_error(&main_repo, worktree_path, cx).await;
                 rollback_backup(
                     app_state.fs.as_ref(),
                     backup.as_ref(),
@@ -814,7 +812,7 @@ pub async fn restore_worktree_via_git(
         .and_then(|r| r)
     {
         let error = error.context("failed to restore archive checkpoint");
-        remove_new_worktree_on_error(created_new_worktree, &main_repo, worktree_path, cx).await;
+        remove_new_worktree_on_error(&main_repo, worktree_path, cx).await;
         rollback_backup(
             app_state.fs.as_ref(),
             backup.as_ref(),
@@ -949,17 +947,14 @@ async fn worktree_path_has_content(fs: &dyn Fs, path: &Path) -> Result<bool> {
 }
 
 async fn remove_new_worktree_on_error(
-    created_new_worktree: bool,
     main_repo: &Entity<Repository>,
     worktree_path: &PathBuf,
     cx: &mut AsyncApp,
 ) {
-    if created_new_worktree {
-        let rx = main_repo.update(cx, |repo, _cx| {
-            repo.remove_worktree(worktree_path.clone(), true)
-        });
-        rx.await.ok().and_then(|r| r.log_err());
-    }
+    let rx = main_repo.update(cx, |repo, _cx| {
+        repo.remove_worktree(worktree_path.clone(), true)
+    });
+    rx.await.ok().and_then(|r| r.log_err());
 }
 
 /// Deletes the git ref and DB records for a single archived worktree.
