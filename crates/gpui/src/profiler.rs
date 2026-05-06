@@ -1,3 +1,4 @@
+use itertools::Itertools;
 use scheduler::{Instant, SpawnTime};
 use std::{
     cell::LazyCell,
@@ -12,6 +13,10 @@ use std::{
     time::Duration,
 };
 
+mod actions;
+pub(crate) use actions::{save_action_timing, update_running_action};
+pub use actions::{ActionStatistics, ResolvedActionStatistics, collect_action_stats};
+
 use serde::{Deserialize, Serialize};
 
 use crate::{SharedString, TasksIncluded};
@@ -21,12 +26,23 @@ use crate::{SharedString, TasksIncluded};
 pub struct YieldTime(Instant);
 
 #[doc(hidden)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Copy, Clone)]
 pub struct TaskTiming {
     pub location: &'static core::panic::Location<'static>,
     pub spawned: SpawnTime,
     pub start: Instant,
     pub end: YieldTime,
+}
+
+impl std::fmt::Debug for TaskTiming {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskTiming")
+            .field("location", &self.location)
+            .field("since_spawned", &self.spawned.0.elapsed())
+            .field("last_poll_duration", &self.until_yielded())
+            .field("total_runtime", &self.since_spawn())
+            .finish()
+    }
 }
 
 #[doc(hidden)]
@@ -39,7 +55,7 @@ pub struct ActiveTiming {
 
 impl TaskTiming {
     /// A task timing with a duration of zero. Any task will replace this in history.
-    fn placeholder() -> Self {
+    pub fn placeholder() -> Self {
         let now = Instant::now();
         Self {
             location: std::panic::Location::caller(),
@@ -49,12 +65,12 @@ impl TaskTiming {
         }
     }
 
-    fn until_yielded(&self) -> Duration {
+    pub fn until_yielded(&self) -> Duration {
         self.end.0 - self.start
     }
 
     fn since_spawn(&self) -> Duration {
-        self.spawned.0.elapsed()
+        self.end.0 - self.spawned.0
     }
 }
 
@@ -70,7 +86,7 @@ pub struct ThreadTaskTimings {
 
 impl ThreadTaskTimings {
     /// Convert global thread timings into their structured format.
-    pub fn convert(timings: &[GlobalThreadTimings], included: TasksIncluded) -> Vec<Self> {
+    pub fn collect(timings: &[GlobalThreadTimings], included: TasksIncluded) -> Vec<Self> {
         timings
             .iter()
             .filter_map(|t| match t.timings.upgrade() {
@@ -104,6 +120,59 @@ impl ThreadTaskTimings {
                     timings: vec,
                     stats: timings.stats.clone(),
                     total_pushed,
+                }
+            })
+            .collect()
+    }
+}
+
+#[doc(hidden)]
+pub struct ThreadTaskStatistics {
+    pub thread_name: Option<String>,
+    pub thread_id: ThreadId,
+    pub stats: TaskStatistics,
+}
+
+impl ThreadTaskStatistics {
+    /// Convert global thread timings into their structured format.
+    pub fn collect(timings: &[GlobalThreadTimings], include_running: TasksIncluded) -> Vec<Self> {
+        timings
+            .iter()
+            .filter_map(|t| match t.timings.upgrade() {
+                Some(timings) => Some((t.thread_id, timings)),
+                _ => None,
+            })
+            .map(|(thread_id, timings)| {
+                let timings = timings.lock();
+                let thread_name = timings.thread_name.clone();
+
+                let mut stats = timings.stats.clone();
+                if let TasksIncluded::CompletedAndRunning = include_running
+                    && let Some(ActiveTiming {
+                        location,
+                        spawned,
+                        start,
+                    }) = timings.running
+                {
+                    let end = YieldTime(Instant::now());
+                    stats.add_runtime(TaskTiming {
+                        location,
+                        spawned,
+                        start,
+                        end,
+                    });
+                    stats.add_yield_timing(TaskTiming {
+                        location,
+                        spawned,
+                        start,
+                        end,
+                    });
+                }
+
+                Self {
+                    thread_name,
+                    thread_id,
+                    stats,
                 }
             })
             .collect()
@@ -308,18 +377,19 @@ pub struct GlobalThreadTimings {
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct TaskStatistics {
-    pub nth_worst_yield_time: Duration,
-    pub nth_longest_runtime: Duration,
-    pub worst_yield_times: [TaskTiming; 5],
+    pub poll_time_to_beat: Duration,
+    pub runtime_to_beat: Duration,
+    pub longest_poll_times: [TaskTiming; 5],
     pub longest_runtimes: [TaskTiming; 5],
 }
 
 impl std::fmt::Display for TaskStatistics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Tasks that blocked the longest before yielding\n")?;
-        for timing in self.worst_yield_times {
+        for timing in self.longest_poll_times {
             f.write_fmt(format_args!(
-                "{}:{}\n",
+                "{:<20} - {}:{}\n",
+                format!("{:?}", timing.until_yielded()),
                 timing.location.file(),
                 timing.location.column()
             ))?;
@@ -327,7 +397,8 @@ impl std::fmt::Display for TaskStatistics {
         f.write_str("Tasks that did the most work before completing\n")?;
         for timing in self.longest_runtimes {
             f.write_fmt(format_args!(
-                "{}:{}\n",
+                "{:<20} - {}:{}\n",
+                format!("{:?}", timing.since_spawn()),
                 timing.location.file(),
                 timing.location.column()
             ))?;
@@ -339,38 +410,50 @@ impl std::fmt::Display for TaskStatistics {
 impl TaskStatistics {
     pub fn new() -> Self {
         Self {
-            nth_worst_yield_time: Duration::ZERO,
-            nth_longest_runtime: Duration::ZERO,
-            worst_yield_times: [TaskTiming::placeholder(); 5],
+            poll_time_to_beat: Duration::ZERO,
+            runtime_to_beat: Duration::ZERO,
+            longest_poll_times: [TaskTiming::placeholder(); 5],
             longest_runtimes: [TaskTiming::placeholder(); 5],
         }
     }
 
     fn add_yield_timing(&mut self, task: TaskTiming) {
         let yielded_after = task.until_yielded();
-        if yielded_after > self.nth_worst_yield_time {
-            cold_path();
-            self.nth_worst_yield_time = yielded_after;
+        if yielded_after >= self.poll_time_to_beat {
+            cold_path(); // most tasks are not the worst, optimize for that
             let to_replace = self
-                .worst_yield_times
+                .longest_poll_times
                 .iter()
-                .position(|task| yielded_after > task.until_yielded())
-                .expect("guarded by the comparison with nth_worst_yield_time");
-            self.worst_yield_times[to_replace] = task;
+                .position_min_by_key(|task| task.since_spawn())
+                .expect("guarded by the comparison with nth_longest_yield_time");
+            self.longest_poll_times[to_replace] = task;
+
+            self.poll_time_to_beat = self
+                .longest_poll_times
+                .iter()
+                .map(|task| task.since_spawn())
+                .min()
+                .expect("never empty");
         }
     }
 
     fn add_runtime(&mut self, task: TaskTiming) {
         let runtime = task.since_spawn();
-        if runtime > self.nth_longest_runtime {
-            cold_path();
-            self.nth_longest_runtime = runtime;
+        if runtime >= self.runtime_to_beat {
+            cold_path(); // most tasks are not the worst, optimize for that
             let to_replace = self
                 .longest_runtimes
                 .iter()
-                .position(|task| runtime > task.until_yielded())
+                .position_min_by_key(|task| task.since_spawn())
                 .expect("guarded by the comparison with nth_longest_yield_time");
             self.longest_runtimes[to_replace] = task;
+
+            self.runtime_to_beat = self
+                .longest_runtimes
+                .iter()
+                .map(|task| task.since_spawn())
+                .min()
+                .expect("never empty");
         }
     }
 }
@@ -437,9 +520,6 @@ impl ThreadTimings {
     }
 
     pub fn save_task_timing(&mut self, ended: YieldTime) {
-        if self.timings.len() >= MAX_TASK_TIMINGS {
-            self.timings.pop_front();
-        }
         let ActiveTiming {
             location,
             start,
@@ -447,7 +527,8 @@ impl ThreadTimings {
         } = self
             .running
             .take()
-            .expect("only called after register_task_start");
+            .expect("this function is only ever called after register_task_start");
+
         let timing = TaskTiming {
             location,
             spawned,
@@ -458,7 +539,10 @@ impl ThreadTimings {
         self.stats.add_runtime(timing);
 
         if trace_enabled() {
-            cold_path(); // prioritize performance with profiling off
+            cold_path(); // optimize for when the profiling is off
+            if self.timings.len() >= MAX_TASK_TIMINGS {
+                self.timings.pop_front();
+            }
             self.timings.push_back(timing);
             self.total_pushed += 1;
         }

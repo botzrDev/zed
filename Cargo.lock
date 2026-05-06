@@ -7666,6 +7666,7 @@ dependencies = [
  "gpui_util",
  "gpui_web",
  "hdrhistogram",
+ "heapless",
  "http_client",
  "image",
  "inventory",

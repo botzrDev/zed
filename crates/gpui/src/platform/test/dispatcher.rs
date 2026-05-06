@@ -126,6 +126,10 @@ impl PlatformDispatcher for TestDispatcher {
         }
     }
 
+    fn get_all_stats(&self, _: TasksIncluded) -> Vec<crate::ThreadTaskStatistics> {
+        Vec::new()
+    }
+
     fn is_main_thread(&self) -> bool {
         self.scheduler.is_main_thread()
     }

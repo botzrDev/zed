@@ -1975,6 +1975,11 @@ impl App {
         self
     }
 
+    pub(crate) fn try_resolve_action(&self, type_id: TypeId) -> Option<&'static str> {
+        self.actions.try_resolve_action(&type_id)
+
+    }
+
     /// Event handlers propagate events by default. Call this method to stop dispatching to
     /// event handlers with a lower z-index (mouse) or higher in the tree (keyboard). This is
     /// the opposite of [`Self::propagate`]. It's also possible to cancel a call to [`Self::propagate`] by

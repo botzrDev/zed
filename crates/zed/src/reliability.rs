@@ -2,7 +2,10 @@ use anyhow::{Context as _, Result};
 use client::{Client, telemetry::MINIDUMP_ENDPOINT};
 use feature_flags::FeatureFlagAppExt;
 use futures::{AsyncReadExt, TryStreamExt};
-use gpui::{App, AppContext as _, SerializedThreadTaskTimings, TasksIncluded, profiler};
+use gpui::{
+    ActionStatistics, App, AppContext, AsyncApp, FutureExt, ResolvedActionStatistics,
+    SerializedThreadTaskTimings, TasksIncluded, profiler,
+};
 use http_client::{self, AsyncBody, HttpClient, Request};
 use log::info;
 use project::Project;
@@ -12,29 +15,42 @@ use reqwest::{
     multipart::{Form, Part},
 };
 use serde::Deserialize;
-use smol::stream::StreamExt;
-use std::{ffi::OsStr, fmt::Write, fs, str::FromStr, sync::Arc, thread::ThreadId, time::Duration};
+use smol::{
+    channel::{Receiver, Sender},
+    stream::StreamExt,
+};
+use std::{
+    ffi::OsStr,
+    fmt::Write,
+    fs,
+    path::PathBuf,
+    sync::Arc,
+    thread::{self, ThreadId},
+    time::Duration,
+};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use util::ResultExt;
 
 use crate::STARTUP_TIME;
 
-const MAX_HANG_TRACES: usize = 3;
-
 gpui::actions!(
     dev,
     [
         /// Causes a performance hang to test performance monitoring
-        HangMainThread,
+        HangAction,
+        /// Causes a performance hang to test performance monitoring
+        HangBackground,
+        /// Causes a performance hang to test performance monitoring
+        HangForeground,
     ]
 );
 
 pub fn init(client: Arc<Client>, cx: &mut App) {
-    if cfg!(debug_assertions) {
-        log::info!("Debug assertions enabled, skipping hang monitoring");
-    } else {
-        monitor_hangs(cx);
-    }
+    // if cfg!(debug_assertions) {
+    //     log::info!("Debug assertions enabled, skipping hang monitoring");
+    // } else {
+    start_hang_detection(cx);
+    // }
 
     cx.on_flags_ready({
         let client = client.clone();
@@ -58,9 +74,33 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
         .detach()
     }
 
-    cx.on_action(move |_: &HangMainThread, _| {
-        info!("Hanging main thread for 3 seconds to test performance monitoring! The app will be unresponsive");
-        std::thread::sleep(Duration::from_secs(3));
+    cx.on_action(move |_: &HangAction, _| {
+        log::warn!(
+            "Hanging the foreground for 5 seconds by blocking in an action.
+            Zed will be unresponsive for that time. This should trigger a report in the log"
+        );
+        std::thread::sleep(Duration::from_secs(5));
+        log::warn!("Hang ended");
+    });
+    cx.on_action(move |_: &HangBackground, cx| {
+        cx.background_spawn(async {
+            log::warn!(
+                "Hanging a background executor for 5 seconds! This should trigger a report in the log"
+            );
+            std::thread::sleep(Duration::from_secs(5));
+            log::warn!("Hang ended");
+        }).detach();
+    });
+    cx.on_action(move |_: &HangForeground, cx| {
+        cx.spawn(async |_| {
+            log::warn!(
+                "Hanging the foreground executor for 5 seconds to test performance monitoring! \
+            Zed will be unresponsive for that time. This should trigger a report in the log"
+            );
+            std::thread::sleep(Duration::from_secs(5));
+            log::warn!("Hang ended");
+        })
+        .detach();
     });
 
     cx.observe_new(move |project: &mut Project, _, cx| {
@@ -102,55 +142,145 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
     .detach();
 }
 
-fn monitor_hangs(cx: &App) {
-    let main_thread_id = std::thread::current().id();
+fn start_hang_detection(cx: &App) {
+    let foreground_thread = std::thread::current().id();
+    // TODO!(yara) use the CX in a way that makes it so this must be run on the
+    // foregrund exec
 
-    let foreground_executor = cx.foreground_executor();
-    let background_executor = cx.background_executor();
+    let background_executor = cx.background_executor().clone();
 
-    // 3 seconds hang
-    let (mut tx, mut rx) = futures::channel::mpsc::channel(3);
-    foreground_executor
-        .spawn(async move { while (rx.next().await).is_some() {} })
+    // need to run on the foreground to access the actions registry
+    // so we have a this little dance to get the data back out
+    //
+    // TODO!(yara) remove all this complexity and just have a copy of the action
+    // registry aroung (Arc::weak?)
+    let (request_tx, rx) = smol::channel::bounded(1);
+    let (tx, response_rx) = smol::channel::bounded(1);
+    async fn action_resolver(
+        rx: smol::channel::Receiver<ActionStatistics>,
+        tx: smol::channel::Sender<ResolvedActionStatistics>,
+        cx: AsyncApp,
+    ) {
+        while let Ok(stats) = rx.recv().await {
+            let resolved = cx.update(|cx| stats.resolve(cx));
+            if tx.try_send(resolved).is_err() {
+                log::error!("profiler action resolver lagging behind")
+            }
+        }
+    }
+    cx.spawn(async move |cx| action_resolver(rx, tx, cx.clone()))
         .detach();
 
-    background_executor
-        .spawn({
-            let background_executor = background_executor.clone();
-            async move {
-                cleanup_old_hang_traces();
+    // an OS thread to insulate detection and reporting from hangs on the fore
+    // or background.
+    thread::Builder::new()
+        .name("HangDetection".to_string())
+        .spawn(move || {
+            // TODO!(yara) make this recently reported and bound the size of the collection
 
-                let mut hang_time = None;
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let task_stats = background_executor
+                    .dispatcher()
+                    .get_all_stats(TasksIncluded::CompletedAndRunning);
 
-                let mut hanging = false;
-                loop {
-                    background_executor.timer(Duration::from_secs(1)).await;
-                    match tx.try_send(()) {
-                        Ok(_) => {
-                            hang_time = None;
-                            hanging = false;
-                            continue;
-                        }
-                        Err(e) => {
-                            let is_full = e.into_send_error().is_full();
-                            if is_full && !hanging {
-                                hanging = true;
-                                hang_time = Some(chrono::Local::now());
-                            }
+                // TODO!(yara) make these objects and only report new-ish issues
+                report_hanging_foreground_tasks(&task_stats, foreground_thread);
+                report_hanging_background_tasks(&task_stats, foreground_thread);
+                report_hanging_actions(&request_tx, &response_rx, &background_executor);
 
-                            if is_full {
-                                save_hang_trace_and_print_stats(
-                                    main_thread_id,
-                                    &background_executor,
-                                    hang_time.unwrap(),
-                                );
-                            }
-                        }
-                    }
-                }
+                // TODO!(yara) save a trace again
             }
         })
-        .detach();
+        .expect("App can always spawn threads");
+}
+
+fn report_hanging_foreground_tasks(
+    task_stats: &[gpui::ThreadTaskStatistics],
+    foreground_thread: ThreadId,
+) {
+    let foreground = task_stats
+        .iter()
+        .find(|t| t.thread_id == foreground_thread)
+        .expect("main thread should be in all statistics");
+
+    if foreground
+        .stats
+        .longest_poll_times
+        .iter()
+        .any(|task| task.until_yielded() > Duration::from_millis(600))
+    {
+        info!("Foreground hang detected:\n\t{}", foreground.stats);
+    }
+}
+
+fn report_hanging_background_tasks(
+    task_stats: &[gpui::ThreadTaskStatistics],
+    foreground_thread: ThreadId,
+) {
+    let background = task_stats
+        .iter()
+        .filter(|t| t.thread_id != foreground_thread);
+
+    for worker in background {
+        if worker
+            .stats
+            .longest_poll_times
+            .iter()
+            .any(|stat| stat.until_yielded() > Duration::from_millis(600))
+        {
+            info!(
+                "Background hang detected on worker {}:\n\t{}",
+                worker.thread_name.as_deref().unwrap_or_else(|| "Unknown"),
+                worker.stats
+            );
+        }
+    }
+}
+
+fn report_hanging_actions(
+    request_tx: &Sender<ActionStatistics>,
+    response_rx: &Receiver<ResolvedActionStatistics>,
+    background_executor: &gpui::BackgroundExecutor,
+) {
+    let Some(stats) = action_statistics(request_tx, response_rx, background_executor) else {
+        return;
+    };
+
+    if stats
+        .0
+        .iter()
+        .any(|s| s.runtime() > Duration::from_millis(600))
+    {
+        info!("Action hang detected:\n\t{}", stats);
+    }
+}
+
+fn action_statistics(
+    request_tx: &Sender<ActionStatistics>,
+    response_rx: &Receiver<ResolvedActionStatistics>,
+    background_executor: &gpui::BackgroundExecutor,
+) -> Option<ResolvedActionStatistics> {
+    if request_tx
+        .send_blocking(profiler::collect_action_stats())
+        .is_err()
+    {
+        return None; // app closing
+    }
+    let Ok(stats) = smol::block_on(
+        response_rx
+            .recv()
+            // during extreme lag we may need to wait a fair bit
+            // before we get to get things from the foreground
+            .with_timeout(Duration::from_secs(30), &background_executor),
+    )
+    .unwrap_or_else(|_| {
+        log::error!("Extreme hang, could not get foreground info within 30s");
+        Ok(ResolvedActionStatistics::empty())
+    }) else {
+        return None; // app closing
+    };
+    Some(stats)
 }
 
 fn cleanup_old_hang_traces() {
@@ -165,6 +295,7 @@ fn cleanup_old_hang_traces() {
             })
             .collect();
 
+        const MAX_HANG_TRACES: usize = 3;
         if files.len() > MAX_HANG_TRACES {
             files.sort_by_key(|entry| entry.file_name());
             for entry in files.iter().take(files.len() - MAX_HANG_TRACES) {
@@ -174,13 +305,12 @@ fn cleanup_old_hang_traces() {
     }
 }
 
-fn format_task_statistics(stats: &[gpui::ThreadTaskTimings]) -> Option<String> {
+fn format_task_statistics(stats: &[gpui::ThreadTaskStatistics]) -> Option<String> {
     let mut res = String::new();
-    for gpui::ThreadTaskTimings {
+    for gpui::ThreadTaskStatistics {
         thread_name,
         thread_id,
         stats,
-        ..
     } in stats
     {
         let name = thread_name
@@ -192,10 +322,14 @@ fn format_task_statistics(stats: &[gpui::ThreadTaskTimings]) -> Option<String> {
     Some(res)
 }
 
-fn save_traces() -> Option<()> {
-if profiler::trace_enabled() {
-    return None
-}
+fn save_traces(
+    background_executor: &gpui::BackgroundExecutor,
+    main_thread_id: ThreadId,
+) -> Option<PathBuf> {
+    let thread_timings = background_executor
+        .dispatcher()
+        .get_all_timings(TasksIncluded::CompletedAndRunning);
+
     let thread_timings = thread_timings
         .into_iter()
         .map(|mut timings| {
@@ -207,59 +341,25 @@ if profiler::trace_enabled() {
         })
         .collect::<Vec<_>>();
 
-    let trace_path = paths::hang_traces_dir().join(&format!(
-        "hang-{}.miniprof.json",
-        hang_time.format("%Y-%m-%d_%H-%M-%S")
-    ));
-
     let Some(timings) = serde_json::to_string(&thread_timings)
         .context("hang timings serialization")
         .log_err()
     else {
-        return;
+        return None;
     };
 
-    if let Ok(entries) = std::fs::read_dir(paths::hang_traces_dir()) {
-        let mut files: Vec<_> = entries
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .is_some_and(|ext| ext == "json" || ext == "miniprof")
-            })
-            .collect();
-
-        if files.len() >= MAX_HANG_TRACES {
-            files.sort_by_key(|entry| entry.file_name());
-            for entry in files.iter().take(files.len() - (MAX_HANG_TRACES - 1)) {
-                std::fs::remove_file(entry.path()).log_err();
-            }
-        }
-    }
-
-    std::fs::write(&trace_path, timings)
-        .context("hang trace file writing")
-        .log_err();
-}
-
-fn save_hang_trace_and_print_stats(
-    main_thread_id: ThreadId,
-    background_executor: &gpui::BackgroundExecutor,
-    hang_time: chrono::DateTime<chrono::Local>,
-) {
-    let thread_timings = background_executor
-        .dispatcher()
-        .get_all_timings(TasksIncluded::CompletedAndRunning);
-    let thread_stats = format_task_statistics(&thread_timings);
-
-    info!("hang detected");
-    if let Some(trace_path) = save_traces(){
-        info!("task trace saved at: {}", trace_path);
-    }
-
-    if let Some(stats) = thread_stats {
-        info!("task statistics:\n{}", stats);
+    if profiler::trace_enabled() {
+        None
+    } else {
+        cleanup_old_hang_traces();
+        let trace_path = paths::hang_traces_dir().join(&format!(
+            "hang-{}.miniprof.json",
+            chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
+        ));
+        std::fs::write(&trace_path, timings)
+            .context("hang trace file writing")
+            .log_err();
+        Some(trace_path)
     }
 }
 
