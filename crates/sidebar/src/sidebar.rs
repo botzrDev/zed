@@ -2775,11 +2775,18 @@ impl Sidebar {
 
         let restore_task = cx.spawn_in(window, async move |this, cx| {
             let result: anyhow::Result<()> = async {
+                let archived_worktrees = task.await?;
+
                 let store_entity =
                     cx.update(|_window, cx| ThreadMetadataStore::global(cx))?;
+                let restore_paths: Vec<PathBuf> = archived_worktrees
+                    .iter()
+                    .map(|row| row.worktree_path.clone())
+                    .collect();
                 let _restore_guard = match ThreadMetadataStore::try_claim_restore(
                     &store_entity,
                     thread_id,
+                    restore_paths,
                     &mut *cx,
                 ) {
                     Some(guard) => guard,
@@ -2814,8 +2821,6 @@ impl Sidebar {
                         return anyhow::Ok(());
                     }
                 };
-
-                let archived_worktrees = task.await?;
 
                 if archived_worktrees.is_empty() {
                     this.update_in(cx, |this, window, cx| {

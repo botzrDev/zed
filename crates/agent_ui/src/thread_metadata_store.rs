@@ -477,6 +477,7 @@ pub struct ThreadMetadataStore {
     /// `restoring_tasks` state still exists in `Sidebar`, this is the
     /// cross-window claim layer in front of it.
     restoring: HashSet<ThreadId>,
+    restoring_paths: HashSet<PathBuf>,
     _db_operations_task: Task<()>,
 }
 
@@ -485,6 +486,7 @@ pub struct ThreadMetadataStore {
 /// claim is released even on early returns or panics.
 pub struct RestoreGuard {
     thread_id: ThreadId,
+    paths: Vec<PathBuf>,
     store: WeakEntity<ThreadMetadataStore>,
     cx: gpui::AsyncApp,
 }
@@ -498,12 +500,14 @@ impl Drop for RestoreGuard {
         // re-enter `App::borrow_mut()` and panic with `BorrowMutError`.
         let store = self.store.clone();
         let thread_id = self.thread_id;
+        let paths = std::mem::take(&mut self.paths);
         let mut cx = self.cx.clone();
         self.cx
             .spawn(async move |_| {
                 store
                     .update(&mut cx, |store, _| {
                         store.finish_restoring(thread_id);
+                        store.finish_restoring_paths(&paths);
                     })
                     .ok();
             })
@@ -593,6 +597,22 @@ impl ThreadMetadataStore {
         self.restoring.contains(&thread_id)
     }
 
+    pub fn begin_restoring_paths(&mut self, paths: &[PathBuf]) -> bool {
+        if paths.iter().any(|p| self.restoring_paths.contains(p)) {
+            return false;
+        }
+        for path in paths {
+            self.restoring_paths.insert(path.clone());
+        }
+        true
+    }
+
+    pub fn finish_restoring_paths(&mut self, paths: &[PathBuf]) {
+        for path in paths {
+            self.restoring_paths.remove(path);
+        }
+    }
+
     /// Attempts to claim exclusive ownership of restoring `thread_id`. If
     /// some other caller already holds a claim, returns `None` — the caller
     /// should surface a "this thread is already being restored in another
@@ -601,14 +621,25 @@ impl ThreadMetadataStore {
     pub fn try_claim_restore(
         this: &Entity<Self>,
         thread_id: ThreadId,
+        paths: Vec<PathBuf>,
         cx: &mut gpui::AsyncApp,
     ) -> Option<RestoreGuard> {
-        let claimed = this.update(cx, |store, _| store.begin_restoring(thread_id));
+        let claimed = this.update(cx, |store, _| {
+            if !store.begin_restoring(thread_id) {
+                return false;
+            }
+            if !store.begin_restoring_paths(&paths) {
+                store.finish_restoring(thread_id);
+                return false;
+            }
+            true
+        });
         if !claimed {
             return None;
         }
         Some(RestoreGuard {
             thread_id,
+            paths,
             store: this.downgrade(),
             cx: cx.clone(),
         })
@@ -1218,6 +1249,7 @@ impl ThreadMetadataStore {
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
             restoring: HashSet::default(),
+            restoring_paths: HashSet::default(),
             _db_operations_task,
         };
         let _ = this.reload(cx);
@@ -4106,8 +4138,9 @@ mod tests {
         let store = cx.update(|cx| ThreadMetadataStore::global(cx));
 
         let mut async_cx = cx.to_async();
-        let first_guard = ThreadMetadataStore::try_claim_restore(&store, thread_id, &mut async_cx)
-            .expect("first claim should succeed");
+        let first_guard =
+            ThreadMetadataStore::try_claim_restore(&store, thread_id, vec![], &mut async_cx)
+                .expect("first claim should succeed");
 
         cx.update(|cx| {
             assert!(
@@ -4116,7 +4149,8 @@ mod tests {
             );
         });
 
-        let second = ThreadMetadataStore::try_claim_restore(&store, thread_id, &mut async_cx);
+        let second =
+            ThreadMetadataStore::try_claim_restore(&store, thread_id, vec![], &mut async_cx);
         assert!(
             second.is_none(),
             "a second concurrent claim must be rejected while the first guard is alive"
@@ -4132,9 +4166,53 @@ mod tests {
             );
         });
 
-        let third = ThreadMetadataStore::try_claim_restore(&store, thread_id, &mut async_cx)
-            .expect("a fresh claim should succeed after the previous guard was dropped");
+        let third =
+            ThreadMetadataStore::try_claim_restore(&store, thread_id, vec![], &mut async_cx)
+                .expect("a fresh claim should succeed after the previous guard was dropped");
         drop(third);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_try_claim_restore_rejects_overlapping_paths(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let thread_a = ThreadId::new();
+        let thread_b = ThreadId::new();
+        let shared_path = PathBuf::from("/tmp/shared-worktree");
+        let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+
+        let mut async_cx = cx.to_async();
+        let guard_a = ThreadMetadataStore::try_claim_restore(
+            &store,
+            thread_a,
+            vec![shared_path.clone()],
+            &mut async_cx,
+        )
+        .expect("first claim should succeed");
+
+        let attempt_b = ThreadMetadataStore::try_claim_restore(
+            &store,
+            thread_b,
+            vec![shared_path.clone()],
+            &mut async_cx,
+        );
+        assert!(
+            attempt_b.is_none(),
+            "a second thread targeting the same path must be rejected"
+        );
+
+        drop(guard_a);
+        cx.run_until_parked();
+
+        let guard_b = ThreadMetadataStore::try_claim_restore(
+            &store,
+            thread_b,
+            vec![shared_path.clone()],
+            &mut async_cx,
+        )
+        .expect("claim should succeed after the first guard is dropped");
+        drop(guard_b);
         cx.run_until_parked();
     }
 }
