@@ -42,6 +42,7 @@ use parser::CodeBlockMetadata;
 use parser::{
     MarkdownEvent, MarkdownTag, MarkdownTagEnd, parse_links_only, parse_markdown_with_options,
 };
+pub use parser::{WikiLink, extract_wiki_links};
 use pulldown_cmark::{Alignment, BlockQuoteKind, LinkType};
 use sum_tree::TreeMap;
 use theme::SyntaxTheme;

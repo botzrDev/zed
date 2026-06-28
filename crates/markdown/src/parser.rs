@@ -575,6 +575,38 @@ fn build_footnote_definitions(
     definitions
 }
 
+/// A single Obsidian-style `[[wiki link]]` discovered in a Markdown document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WikiLink {
+    /// The linked note name, i.e. the destination before any `|alias`. For
+    /// `[[Page|Alias]]` this is `Page`; for `[[My Note]]` it is `My Note`.
+    pub target: SharedString,
+    /// Byte range of the whole `[[...]]` span in the source text.
+    pub range: Range<usize>,
+}
+
+/// Extracts every `[[wiki link]]` target from a Markdown document, reusing the
+/// full parser so that links inside code spans/blocks are correctly ignored and
+/// `[[target|alias]]` resolves to `target`. Used to build the vault-wide
+/// backlink index.
+pub fn extract_wiki_links(text: &str) -> Vec<WikiLink> {
+    let data = parse_markdown_with_options(text, false, false);
+    data.events
+        .into_iter()
+        .filter_map(|(range, event)| match event {
+            MarkdownEvent::Start(MarkdownTag::Link {
+                link_type: LinkType::WikiLink { .. },
+                dest_url,
+                ..
+            }) => Some(WikiLink {
+                target: dest_url,
+                range,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn parse_links_only(text: &str) -> Vec<(Range<usize>, MarkdownEvent)> {
     let mut events = Vec::new();
     let mut finder = LinkFinder::new();
@@ -1391,5 +1423,18 @@ mod tests {
         }
         assert_eq!(dest_url.as_deref(), Some("Page"));
         assert_eq!(visible_text, "Alias");
+    }
+
+    #[test]
+    fn test_extract_wiki_links() {
+        let source = "See [[Alpha]] and [[Beta|the second]].\n\n`[[Ignored]]` in code and\n\n```\n[[AlsoIgnored]]\n```\n";
+        let links = extract_wiki_links(source);
+        let targets: Vec<&str> = links.iter().map(|link| link.target.as_ref()).collect();
+        assert_eq!(targets, vec!["Alpha", "Beta"]);
+        // The reported range points at the link in the source (used to derive the
+        // backlink's line number), and the wiki links inside the code span and
+        // fenced code block above are correctly ignored.
+        assert!(source[..links[0].range.start].lines().count() <= 1);
+        assert!(source[links[0].range.clone()].contains("Alpha"));
     }
 }

@@ -5,6 +5,10 @@
 //! live as plain Markdown files in the project, so all of Zed's editing,
 //! terminal, git and AI tooling operate on them directly.
 
+mod backlinks;
+
+pub use backlinks::BacklinksPanel;
+
 use std::path::PathBuf;
 
 use editor::{Editor, EditorEvent};
@@ -45,6 +49,9 @@ pub fn init(cx: &mut App) {
             if let Some(panel) = workspace.panel::<NotesPanel>(cx) {
                 panel.update(cx, |panel, cx| panel.new_note(window, cx));
             }
+        });
+        workspace.register_action(|workspace, _: &backlinks::ToggleFocus, window, cx| {
+            workspace.toggle_panel_focus::<BacklinksPanel>(window, cx);
         });
     })
     .detach();
