@@ -42,13 +42,20 @@ use parser::CodeBlockMetadata;
 use parser::{
     MarkdownEvent, MarkdownTag, MarkdownTagEnd, parse_links_only, parse_markdown_with_options,
 };
-use pulldown_cmark::{Alignment, BlockQuoteKind};
+use pulldown_cmark::{Alignment, BlockQuoteKind, LinkType};
 use sum_tree::TreeMap;
 use theme::SyntaxTheme;
 use ui::{Checkbox, CopyButton, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*};
 use util::ResultExt;
 
 use crate::parser::CodeBlockKind;
+
+/// Destination URL prefix used to mark Obsidian-style `[[wiki link]]` targets so
+/// that consumers (e.g. the Markdown preview) can distinguish a vault note name
+/// from an ordinary relative path and resolve it across the project rather than
+/// against the current file's directory. The remainder after this prefix is the
+/// raw note name (and optional `#heading`) from inside the brackets.
+pub const WIKI_LINK_URL_PREFIX: &str = "zed-wiki-link:";
 
 /// A callback function that can be used to customize the style of links based on the destination URL.
 /// If the callback returns `None`, the default link style will be used.
@@ -1983,14 +1990,23 @@ impl Element for MarkdownElement {
                                 ..Default::default()
                             })
                         }
-                        MarkdownTag::Link { dest_url, .. } => {
+                        MarkdownTag::Link {
+                            dest_url,
+                            link_type,
+                            ..
+                        } => {
                             if builder.code_block_stack.is_empty() {
+                                let dest_url = if matches!(link_type, LinkType::WikiLink { .. }) {
+                                    SharedString::from(format!("{WIKI_LINK_URL_PREFIX}{dest_url}"))
+                                } else {
+                                    dest_url.clone()
+                                };
                                 builder.push_link(dest_url.clone(), range.clone());
                                 let style = self
                                     .style
                                     .link_callback
                                     .as_ref()
-                                    .and_then(|callback| callback(dest_url, cx))
+                                    .and_then(|callback| callback(&dest_url, cx))
                                     .unwrap_or_else(|| self.style.link.clone());
                                 builder.push_text_style(style)
                             }

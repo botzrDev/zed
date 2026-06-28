@@ -1362,6 +1362,124 @@ fn snippet_completions(
     })
 }
 
+/// File extensions treated as vault notes when completing `[[wiki links]]`.
+const MARKDOWN_NOTE_EXTENSIONS: &[&str] = &["md", "markdown", "mdx", "mdown", "mkd", "mdwn"];
+
+/// Provides Obsidian-style `[[note]]` completions when the cursor sits inside an
+/// open wiki link in a Markdown buffer. Returns `None` (so the normal
+/// LSP/word-completion path runs) for any other context. The completion list is
+/// the set of unique Markdown note names across the project's worktrees.
+fn wiki_link_completions(
+    project: &Entity<Project>,
+    buffer: &Entity<Buffer>,
+    buffer_position: text::Anchor,
+    cx: &mut Context<Editor>,
+) -> Option<Vec<CompletionResponse>> {
+    let (replace_range, match_start, suffix) = {
+        let snapshot = buffer.read(cx).snapshot();
+        let is_markdown = snapshot
+            .language_at(buffer_position)
+            .is_some_and(|language| language.name().as_ref() == "Markdown");
+        if !is_markdown {
+            return None;
+        }
+        let cursor_offset = buffer_position.to_offset(&snapshot);
+
+        // Walk backwards from the cursor along the current line looking for an
+        // open `[[`. Bail if a newline or a closing bracket is hit first, or if
+        // no `[[` is found.
+        let mut query_byte_len = 0usize;
+        let mut found_open = false;
+        let mut chars = snapshot.reversed_chars_at(buffer_position);
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\n' | ']' => return None,
+                '[' => {
+                    found_open = chars.next() == Some('[');
+                    break;
+                }
+                _ => {
+                    query_byte_len += ch.len_utf8();
+                    if query_byte_len > 512 {
+                        return None;
+                    }
+                }
+            }
+        }
+        if !found_open {
+            return None;
+        }
+
+        let query_start = cursor_offset.saturating_sub(query_byte_len);
+        let start_anchor = snapshot.anchor_before(query_start);
+        let replace_range = start_anchor..buffer_position;
+
+        // Append the closing `]]` unless it is already present after the cursor.
+        let mut following = snapshot.chars_at(buffer_position);
+        let already_closed = following.next() == Some(']') && following.next() == Some(']');
+        let suffix = if already_closed { "" } else { "]]" };
+
+        (replace_range, start_anchor, suffix)
+    };
+
+    let mut titles: Vec<String> = Vec::new();
+    let mut seen = HashSet::default();
+    let project = project.read(cx);
+    for worktree in project.visible_worktrees(cx) {
+        let worktree = worktree.read(cx);
+        let snapshot = worktree.snapshot();
+        for entry in snapshot.entries(false, 0) {
+            if !entry.is_file() {
+                continue;
+            }
+            let Some(extension) = entry.path.extension() else {
+                continue;
+            };
+            if !MARKDOWN_NOTE_EXTENSIONS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(extension))
+            {
+                continue;
+            }
+            let Some(stem) = entry.path.file_stem() else {
+                continue;
+            };
+            if seen.insert(stem.to_string()) {
+                titles.push(stem.to_string());
+            }
+        }
+    }
+    if titles.is_empty() {
+        return None;
+    }
+    titles.sort_by(|left, right| left.to_lowercase().cmp(&right.to_lowercase()));
+
+    let completions = titles
+        .into_iter()
+        .map(|title| project::Completion {
+            replace_range: replace_range.clone(),
+            new_text: format!("{title}{suffix}"),
+            label: language::CodeLabel::plain(title, None),
+            documentation: None,
+            source: project::CompletionSource::Custom,
+            icon_path: None,
+            match_start: Some(match_start),
+            snippet_deduplication_key: None,
+            insert_text_mode: None,
+            confirm: None,
+            group: None,
+        })
+        .collect();
+
+    Some(vec![project::CompletionResponse {
+        completions,
+        display_options: project::CompletionDisplayOptions {
+            dynamic_width: true,
+        },
+        is_incomplete: false,
+    }])
+}
+
 impl CompletionProvider for Entity<Project> {
     fn completions(
         &self,
@@ -1371,6 +1489,9 @@ impl CompletionProvider for Entity<Project> {
         _window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> Task<Result<Vec<CompletionResponse>>> {
+        if let Some(responses) = wiki_link_completions(self, buffer, buffer_position, cx) {
+            return Task::ready(Ok(responses));
+        }
         self.update(cx, |project, cx| {
             let task = project.completions(buffer, buffer_position, options, cx);
             cx.background_spawn(task)
@@ -1434,6 +1555,21 @@ impl CompletionProvider for Entity<Project> {
 
         let buffer = buffer.read(cx);
         let snapshot = buffer.snapshot();
+        // Typing the second `[` of an Obsidian-style `[[wiki link]]` should open
+        // the note-name completion menu in Markdown buffers. `position` is
+        // post-insertion, so the two characters before it are the `[[`.
+        if char == '[' {
+            let mut preceding = snapshot.reversed_chars_at(position);
+            let forms_wiki_link =
+                preceding.next() == Some('[') && preceding.next() == Some('[');
+            if forms_wiki_link
+                && snapshot
+                    .language_at(position)
+                    .is_some_and(|language| language.name().as_ref() == "Markdown")
+            {
+                return true;
+            }
+        }
         let classifier = snapshot
             .char_classifier_at(position)
             .scope_context(Some(CharScopeContext::Completion));
