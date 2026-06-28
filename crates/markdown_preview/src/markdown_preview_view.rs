@@ -16,16 +16,18 @@ use gpui::{
 use language::LanguageRegistry;
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
-    MarkdownOptions, MarkdownStyle,
+    MarkdownOptions, MarkdownStyle, WIKI_LINK_URL_PREFIX,
 };
-use project::Project;
 use project::search::SearchQuery;
+use project::{Project, ProjectPath};
 use settings::{SeedQuerySetting, Settings};
 use theme::{SystemAppearance, Theme, ThemeRegistry};
 use theme_settings::ThemeSettings;
 use ui::{ContextMenu, WithScrollbar, prelude::*, right_click_menu};
 use util::markdown::split_local_url_fragment;
 use util::normalize_path;
+use util::paths::PathStyle;
+use util::rel_path::RelPath;
 use workspace::item::{Item, ItemBufferKind, ItemHandle, SaveOptions};
 use workspace::searchable::{
     Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
@@ -732,6 +734,11 @@ fn handle_url_click(
     window: &mut Window,
     cx: &mut App,
 ) {
+    if let Some(note_name) = url.strip_prefix(WIKI_LINK_URL_PREFIX) {
+        open_wiki_link(note_name, workspace, window, cx);
+        return;
+    }
+
     let (path_part, fragment) = split_local_url_fragment(url.as_ref());
 
     if path_part.is_empty() {
@@ -803,6 +810,143 @@ fn open_preview_url(
     }
 
     cx.open_url(url.as_ref());
+}
+
+/// File extensions treated as vault notes when resolving `[[wiki links]]`.
+const WIKI_LINK_NOTE_EXTENSIONS: &[&str] = &["md", "markdown", "mdx", "mdown", "mkd", "mdwn"];
+
+/// Opens the note referenced by a `[[wiki link]]`, resolving its name across the
+/// project's worktrees. When no matching note exists yet, a new Markdown file is
+/// created at the root of the first visible worktree and opened (the Obsidian
+/// "create on click" behavior).
+fn open_wiki_link(
+    note_name: &str,
+    workspace: &WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    // A wiki link may carry an optional `#heading`; only the note name (the part
+    // before `#`) selects which file to open.
+    let note_name = note_name.split('#').next().unwrap_or(note_name).trim();
+    if note_name.is_empty() {
+        return;
+    }
+    let Some(workspace) = workspace.upgrade() else {
+        return;
+    };
+    workspace.update(cx, |workspace, cx| {
+        let project = workspace.project().clone();
+        if let Some(abs_path) = find_wiki_link_note(&project, note_name, cx) {
+            workspace
+                .open_abs_path(
+                    normalize_path(&abs_path),
+                    OpenOptions {
+                        visible: Some(OpenVisible::None),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+                .detach_and_log_err(cx);
+        } else {
+            create_and_open_wiki_link_note(project, note_name, window, cx);
+        }
+    });
+}
+
+/// Searches every visible worktree for a Markdown note matching `note_name`,
+/// either by file stem (e.g. `[[My Note]]` -> `My Note.md`) or by worktree
+/// relative path (e.g. `[[dir/My Note]]`). Returns the absolute path if found.
+fn find_wiki_link_note(project: &Entity<Project>, note_name: &str, cx: &App) -> Option<PathBuf> {
+    let project = project.read(cx);
+    for worktree in project.visible_worktrees(cx) {
+        let worktree = worktree.read(cx);
+        let abs_root = worktree.abs_path();
+        let snapshot = worktree.snapshot();
+        for entry in snapshot.entries(false, 0) {
+            if !entry.is_file() {
+                continue;
+            }
+            let Some(extension) = entry.path.extension() else {
+                continue;
+            };
+            if !WIKI_LINK_NOTE_EXTENSIONS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(extension))
+            {
+                continue;
+            }
+            let stem = entry.path.file_stem().unwrap_or("");
+            let relative = entry.path.display(PathStyle::local());
+            let relative_without_extension = relative
+                .strip_suffix(&format!(".{extension}"))
+                .unwrap_or(relative.as_ref());
+            if stem.eq_ignore_ascii_case(note_name)
+                || relative.eq_ignore_ascii_case(note_name)
+                || relative_without_extension.eq_ignore_ascii_case(note_name)
+            {
+                return Some(abs_root.join(entry.path.as_std_path()));
+            }
+        }
+    }
+    None
+}
+
+/// Creates `<note_name>.md` at the root of the first visible worktree and opens
+/// it. Used when a clicked `[[wiki link]]` points at a note that doesn't exist.
+fn create_and_open_wiki_link_note(
+    project: Entity<Project>,
+    note_name: &str,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(worktree) = project.read(cx).visible_worktrees(cx).next() else {
+        return;
+    };
+    let (worktree_id, abs_root) = {
+        let worktree = worktree.read(cx);
+        (worktree.id(), worktree.abs_path().to_path_buf())
+    };
+
+    let already_has_extension = Path::new(note_name).extension().is_some_and(|extension| {
+        WIKI_LINK_NOTE_EXTENSIONS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(extension.to_string_lossy().as_ref()))
+    });
+    let file_name = if already_has_extension {
+        note_name.to_string()
+    } else {
+        format!("{note_name}.md")
+    };
+
+    let Ok(relative_path) = RelPath::unix(&file_name) else {
+        return;
+    };
+    let relative_path = relative_path.into_arc();
+    let abs_path = abs_root.join(relative_path.as_std_path());
+    let project_path = ProjectPath {
+        worktree_id,
+        path: relative_path,
+    };
+
+    let create = project.update(cx, |project, cx| project.create_entry(project_path, false, cx));
+    cx.spawn_in(window, async move |workspace, cx| {
+        create.await?;
+        let open_task = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_abs_path(
+                normalize_path(&abs_path),
+                OpenOptions {
+                    visible: Some(OpenVisible::None),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            )
+        })?;
+        open_task.await?;
+        anyhow::Ok(())
+    })
+    .detach_and_log_err(cx);
 }
 
 fn split_preview_url(url: &str) -> (&str, Option<&str>) {

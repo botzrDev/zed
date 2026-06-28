@@ -20,7 +20,10 @@ pub const PARSE_OPTIONS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_OLD_FOOTNOTES)
     .union(Options::ENABLE_GFM)
     .union(Options::ENABLE_SUPERSCRIPT)
-    .union(Options::ENABLE_SUBSCRIPT);
+    .union(Options::ENABLE_SUBSCRIPT)
+    // Enables Obsidian-style `[[note]]` / `[[note|alias]]` wiki links, which are
+    // surfaced as `MarkdownTag::Link`s with a `LinkType::WikiLink` link type.
+    .union(Options::ENABLE_WIKILINKS);
 
 #[derive(Default)]
 struct ParseState {
@@ -800,8 +803,7 @@ mod tests {
 
     const UNWANTED_OPTIONS: Options = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
         .union(Options::ENABLE_MATH)
-        .union(Options::ENABLE_DEFINITION_LIST)
-        .union(Options::ENABLE_WIKILINKS);
+        .union(Options::ENABLE_DEFINITION_LIST);
 
     #[test]
     fn all_options_considered() {
@@ -1345,5 +1347,49 @@ mod tests {
                 None,
             ]
         );
+    }
+
+    #[test]
+    fn test_wikilinks() {
+        // A bare `[[Note]]` becomes a wiki link whose destination is the note name.
+        let parsed = parse_markdown_with_options("[[My Note]]", false, false);
+        let link = parsed.events.iter().find_map(|(_, event)| match event {
+            Start(Link {
+                link_type,
+                dest_url,
+                ..
+            }) => Some((*link_type, dest_url.clone())),
+            _ => None,
+        });
+        match link {
+            Some((LinkType::WikiLink { .. }, dest_url)) => {
+                assert_eq!(dest_url.as_ref(), "My Note");
+            }
+            other => panic!("expected a wiki link, got {other:?}"),
+        }
+
+        // `[[Page|Alias]]` links to `Page` but renders the alias text.
+        let source = "[[Page|Alias]]";
+        let parsed = parse_markdown_with_options(source, false, false);
+        let mut dest_url = None;
+        let mut visible_text = String::new();
+        let mut within_wiki_link = false;
+        for (range, event) in &parsed.events {
+            match event {
+                Start(Link {
+                    link_type: LinkType::WikiLink { .. },
+                    dest_url: url,
+                    ..
+                }) => {
+                    dest_url = Some(url.clone());
+                    within_wiki_link = true;
+                }
+                End(MarkdownTagEnd::Link) => within_wiki_link = false,
+                Text if within_wiki_link => visible_text.push_str(&source[range.clone()]),
+                _ => {}
+            }
+        }
+        assert_eq!(dest_url.as_deref(), Some("Page"));
+        assert_eq!(visible_text, "Alias");
     }
 }
